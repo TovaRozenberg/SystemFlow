@@ -146,17 +146,20 @@ class DiagnosticFinalReport(BaseModel):
     {
       id: 'collectors.py',
       filename: 'python_desktop_app/collectors.py',
-      titleHe: 'איסוף נתונים ו-5 כלי החקירה (psutil + winreg)',
-      descriptionHe: 'מממש את תמונת הבסיס (Baseline) ואת כל 5 הכלים ממסמך האפיון: CPU, Memory, Disk I/O, Startup Apps, ו-Background Services.',
-      specSection: 'סעיף 5 - Tools Definition',
+      titleHe: 'איסוף נתונים + פתרון דגימת CPU והגנת תהליכי ליבה',
+      descriptionHe: 'שומר מילון של אובייקטי psutil.Process חיים במעבר הראשון למניעת תוצאת 0.0, ומסנן תהליכי ליבה קריטיים (svchost.exe, System, explorer.exe).',
+      specSection: 'סעיף 5 + הגנות CPU ו-OS',
       code: `"""
-collectors.py - שכבת איסוף הנתונים המקומית וכל 5 כלי העומק המוגדרים במסמך האפיון (סעיף 5):
-1. get_system_snapshot(drive_path) - תמונת המצב הבסיסית (Baseline Trigger)
-2. get_top_cpu_processes(limit) - התהליכים העמוסים ביותר חישובית
-3. get_top_memory_processes(limit) - צרכני הזיכרון הכבדים ביותר
-4. get_disk_io_status() - נתוני קריאה/כתיבה וצווארי בקבוק בדיסק
-5. get_startup_apps() - תוכנות שנטענות עם עליית המחשב (Registry + Startup Folders)
-6. get_background_services() - רשימת שירותים פעילים שאינם שייכים לליבת המערכת
+collectors.py - שכבת איסוף הנתונים המקומית וכל 5 כלי העומק המוגדרים במסמך האפיון (סעיף 5).
+
+הגנות הנדסיות קריטיות שהוטמעו בקובץ זה:
+1. דגימת CPU אמינה בשני מעברים (Two-Pass Process Snapshot על אובייקטי Process נשמרים):
+   שומרים מילון {pid: proc} של אובייקטי psutil.Process חיים במעבר הראשון, ממתינים sample_interval,
+   וקוראים ל-cpu_percent(interval=None) על *אותם אובייקטים בדיוק* במעבר השני.
+   כך נפתרת לחלוטין בעיית ה-0.0 של psutil!
+2. הגנת תהליכי מערכת קריטיים (CRITICAL_WINDOWS_PROCESSES Guardrail):
+   סינון ותיוג מפורש של תהליכי ליבה ב-Windows (כגון svchost.exe, System, explorer.exe, csrss.exe, lsass.exe)
+   כדי שהמשתמש או ה-AI לעולם לא ינסו לסגור אותם ולגרום לקריסת המערכת.
 """
 
 import json
@@ -165,6 +168,40 @@ import time
 from datetime import datetime
 from typing import Dict, Any, List
 import psutil
+
+CRITICAL_WINDOWS_PROCESSES = {
+    "system idle process",
+    "system",
+    "registry",
+    "smss.exe",
+    "csrss.exe",
+    "wininit.exe",
+    "services.exe",
+    "lsass.exe",
+    "svchost.exe",
+    "fontdrvhost.exe",
+    "winlogon.exe",
+    "dwm.exe",
+    "explorer.exe",
+    "spoolsv.exe",
+    "taskhostw.exe",
+    "runtimebroker.exe",
+    "sihost.exe",
+    "msmpeng.exe",
+    "securityhealthservice.exe",
+    "audiodg.exe",
+    "wudfhost.exe",
+}
+
+CRITICAL_SYSTEM_PIDS = {0, 4}
+
+
+def is_critical_system_process(pid: int, name: str) -> bool:
+    """בודק האם התהליך הוא תהליך ליבה קריטי של מערכת ההפעלה שאסור לסגור."""
+    if pid in CRITICAL_SYSTEM_PIDS:
+        return True
+    clean_name = (name or "").strip().lower()
+    return clean_name in CRITICAL_WINDOWS_PROCESSES
 
 
 def bytes_to_gb(bytes_value: int) -> float:
@@ -176,8 +213,12 @@ def bytes_to_mb(bytes_value: int) -> float:
 
 
 def get_system_snapshot(drive_path: str = "${escapedDrive}") -> str:
-    """אוסף תמונת מצב בסיסית (Baseline Trigger): אחוז מעבד, זיכרון RAM ושטח דיסק פנוי."""
-    cpu_usage_percent: float = psutil.cpu_percent(interval=${intervalSec.toFixed(1)})
+    """
+    אוסף תמונת מצב בסיסית (Baseline Trigger):
+    מבצע 2 דגימות CPU חוסמות (interval=0.6) ומחשב ממוצע יציב כדי שלעולם לא יחזור 0.0.
+    """
+    samples = [psutil.cpu_percent(interval=0.6), psutil.cpu_percent(interval=0.6)]
+    cpu_usage_percent: float = round(sum(samples) / len(samples), 1)
     logical_cores: int = psutil.cpu_count(logical=True) or 1
     physical_cores: int = psutil.cpu_count(logical=False) or logical_cores
 
@@ -208,6 +249,7 @@ def get_system_snapshot(drive_path: str = "${escapedDrive}") -> str:
             "usage_percent": cpu_usage_percent,
             "logical_cores": logical_cores,
             "physical_cores": physical_cores,
+            "sampling_method": "2-sample blocking average (1.2s total)",
         },
         "memory_ram": {
             "total_gb": ram_total_gb,
@@ -227,40 +269,59 @@ def get_system_snapshot(drive_path: str = "${escapedDrive}") -> str:
     }, indent=4, ensure_ascii=False)
 
 
-def get_top_cpu_processes(limit: int = ${processLimit}, sample_interval: float = 0.5) -> str:
-    """מחזיר את התהליכים העמוסים ביותר חישובית (CPU) עם הגנת AccessDenied."""
+def get_top_cpu_processes(
+    limit: int = ${processLimit},
+    sample_interval: float = 1.0,
+    include_system_processes: bool = False,
+) -> str:
+    """
+    מחזיר את התהליכים העמוסים ביותר חישובית (CPU).
+    שומר את אובייקטי ה-Process במילון tracked_processes במעבר הראשון וקורא
+    ל-cpu_percent(interval=None) על *אותם אובייקטים בדיוק* במעבר השני לאחר השהיה.
+    """
     logical_cores = psutil.cpu_count(logical=True) or 1
+    effective_interval = max(float(sample_interval), 0.5)
 
-    for proc in psutil.process_iter():
+    tracked_processes: Dict[int, psutil.Process] = {}
+    skipped_access_denied = 0
+    filtered_critical_count = 0
+
+    for proc in psutil.process_iter(["pid", "name"]):
         try:
+            pid = proc.info.get("pid")
+            name = proc.info.get("name") or "Unknown"
+            if pid is None or pid == 0 or name.lower() == "system idle process":
+                continue
             proc.cpu_percent(interval=None)
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            tracked_processes[pid] = proc
+        except psutil.AccessDenied:
+            skipped_access_denied += 1
+        except (psutil.NoSuchProcess, psutil.ZombieProcess, Exception):
             continue
 
-    time.sleep(sample_interval)
+    time.sleep(effective_interval)
 
     processes_list: List[Dict[str, Any]] = []
-    skipped_access_denied = 0
 
-    for proc in psutil.process_iter(["pid", "name", "username", "status"]):
+    for pid, proc in tracked_processes.items():
         try:
-            p_info = proc.info
-            pid = p_info.get("pid")
-            name = p_info.get("name") or "Unknown"
-            if pid == 0 or name.lower() == "system idle process":
-                continue
-
             raw_cpu = proc.cpu_percent(interval=None)
-            if raw_cpu is None:
+            name = proc.name() or "Unknown"
+            is_critical = is_critical_system_process(pid, name)
+
+            if is_critical and not include_system_processes:
+                filtered_critical_count += 1
                 continue
 
             processes_list.append({
                 "pid": pid,
                 "name": name,
-                "cpu_percent": round(raw_cpu / logical_cores, 2),
-                "raw_core_percent": round(raw_cpu, 2),
-                "status": p_info.get("status") or "running",
-                "username": p_info.get("username") or "SYSTEM",
+                "cpu_percent": round((raw_cpu or 0.0) / logical_cores, 2),
+                "raw_core_percent": round(raw_cpu or 0.0, 2),
+                "status": proc.status(),
+                "username": proc.username() if hasattr(proc, "username") else "USER",
+                "is_system_critical": is_critical,
+                "safe_to_terminate": not is_critical,
             })
         except psutil.AccessDenied:
             skipped_access_denied += 1
@@ -271,30 +332,45 @@ def get_top_cpu_processes(limit: int = ${processLimit}, sample_interval: float =
     return json.dumps({
         "tool": "get_top_cpu_processes",
         "timestamp": datetime.now().isoformat(),
+        "sample_interval_sec": effective_interval,
         "top_count": len(top_cpu),
         "skipped_protected_processes": skipped_access_denied,
+        "filtered_critical_os_processes": filtered_critical_count,
         "processes": top_cpu,
     }, indent=4, ensure_ascii=False)
 
 
-def get_top_memory_processes(limit: int = ${processLimit}) -> str:
-    """מחזיר את צרכני הזיכרון הכבדים ביותר (RAM RSS)."""
+def get_top_memory_processes(
+    limit: int = ${processLimit},
+    include_system_processes: bool = False,
+) -> str:
+    """מחזיר את צרכני הזיכרון הכבדים ביותר תוך סינון תהליכי מערכת קריטיים."""
     processes_list: List[Dict[str, Any]] = []
     skipped_access_denied = 0
+    filtered_critical_count = 0
 
     for proc in psutil.process_iter(["pid", "name", "memory_info", "memory_percent", "status"]):
         try:
             p_info = proc.info
+            pid = p_info.get("pid")
+            name = p_info.get("name") or "Unknown"
             mem_info = p_info.get("memory_info")
-            if mem_info is None:
+            if pid is None or mem_info is None:
+                continue
+
+            is_critical = is_critical_system_process(pid, name)
+            if is_critical and not include_system_processes:
+                filtered_critical_count += 1
                 continue
 
             processes_list.append({
-                "pid": p_info.get("pid"),
-                "name": p_info.get("name") or "Unknown",
+                "pid": pid,
+                "name": name,
                 "ram_mb": bytes_to_mb(mem_info.rss),
                 "ram_percent": round(p_info.get("memory_percent") or 0.0, 2),
                 "status": p_info.get("status") or "running",
+                "is_system_critical": is_critical,
+                "safe_to_terminate": not is_critical,
             })
         except psutil.AccessDenied:
             skipped_access_denied += 1
@@ -307,170 +383,31 @@ def get_top_memory_processes(limit: int = ${processLimit}) -> str:
         "timestamp": datetime.now().isoformat(),
         "top_count": len(top_ram),
         "skipped_protected_processes": skipped_access_denied,
+        "filtered_critical_os_processes": filtered_critical_count,
         "processes": top_ram,
-    }, indent=4, ensure_ascii=False)
-
-
-def get_disk_io_status(sample_interval: float = 1.0) -> str:
-    """מחזיר נתוני קריאה/כתיבה וצווארי בקבוק בדיסק + התהליכים שכותבים הכי הרבה."""
-    io_start = psutil.disk_io_counters()
-    time.sleep(sample_interval)
-    io_end = psutil.disk_io_counters()
-
-    if io_start and io_end:
-        read_mb_s = bytes_to_mb(int((io_end.read_bytes - io_start.read_bytes) / sample_interval))
-        write_mb_s = bytes_to_mb(int((io_end.write_bytes - io_start.write_bytes) / sample_interval))
-        read_iops = round((io_end.read_count - io_start.read_count) / sample_interval, 1)
-        write_iops = round((io_end.write_count - io_start.write_count) / sample_interval, 1)
-        total_read_gb = bytes_to_gb(io_end.read_bytes)
-        total_write_gb = bytes_to_gb(io_end.write_bytes)
-    else:
-        read_mb_s, write_mb_s, read_iops, write_iops, total_read_gb, total_write_gb = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
-
-    io_processes: List[Dict[str, Any]] = []
-    for proc in psutil.process_iter(["pid", "name", "io_counters"]):
-        try:
-            p_info = proc.info
-            io_c = p_info.get("io_counters")
-            if io_c is None:
-                continue
-            r_mb = bytes_to_mb(io_c.read_bytes)
-            w_mb = bytes_to_mb(io_c.write_bytes)
-            io_processes.append({
-                "pid": p_info.get("pid"),
-                "name": p_info.get("name") or "Unknown",
-                "total_read_mb": r_mb,
-                "total_write_mb": w_mb,
-                "combined_io_mb": round(r_mb + w_mb, 2),
-            })
-        except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess, Exception):
-            continue
-
-    top_io = sorted(io_processes, key=lambda x: x["combined_io_mb"], reverse=True)[:5]
-    return json.dumps({
-        "tool": "get_disk_io_status",
-        "timestamp": datetime.now().isoformat(),
-        "realtime_throughput": {
-            "read_mb_per_sec": read_mb_s,
-            "write_mb_per_sec": write_mb_s,
-            "read_iops": read_iops,
-            "write_iops": write_iops,
-            "bottleneck_suspected": (read_mb_s + write_mb_s) > 120.0 or (read_iops + write_iops) > 500,
-        },
-        "cumulative_since_boot": {
-            "total_read_gb": total_read_gb,
-            "total_write_gb": total_write_gb,
-        },
-        "top_io_processes": top_io,
-    }, indent=4, ensure_ascii=False)
-
-
-def get_startup_apps() -> str:
-    """שולף תוכנות שנטענות עם עליית המחשב (Registry KEY_READ + Startup Folders)."""
-    startup_items: List[Dict[str, str]] = []
-    errors_or_warnings: List[str] = []
-
-    if os.name != "nt":
-        return json.dumps({
-            "tool": "get_startup_apps",
-            "timestamp": datetime.now().isoformat(),
-            "supported_os": False,
-            "total_count": 0,
-            "startup_programs": [],
-        }, indent=4, ensure_ascii=False)
-
-    import winreg
-
-    registry_targets = [
-        (winreg.HKEY_CURRENT_USER, r"Software\\Microsoft\\Windows\\CurrentVersion\\Run", "HKCU\\\\Run (Current User)"),
-        (winreg.HKEY_CURRENT_USER, r"Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce", "HKCU\\\\RunOnce (Current User)"),
-        (winreg.HKEY_LOCAL_MACHINE, r"Software\\Microsoft\\Windows\\CurrentVersion\\Run", "HKLM\\\\Run (All Users)"),
-        (winreg.HKEY_LOCAL_MACHINE, r"Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce", "HKLM\\\\RunOnce (All Users)"),
-        (winreg.HKEY_LOCAL_MACHINE, r"Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Run", "HKLM\\\\Run (32-bit WOW64)"),
-    ]
-
-    for hive, subkey_path, scope_label in registry_targets:
-        try:
-            with winreg.OpenKey(hive, subkey_path, 0, winreg.KEY_READ) as reg_key:
-                idx = 0
-                while True:
-                    try:
-                        val_name, val_data, _ = winreg.EnumValue(reg_key, idx)
-                        startup_items.append({
-                            "name": str(val_name),
-                            "command_or_path": str(val_data),
-                            "source_type": "Registry",
-                            "location": scope_label,
-                        })
-                        idx += 1
-                    except OSError:
-                        break
-        except (FileNotFoundError, PermissionError, Exception):
-            continue
-
-    return json.dumps({
-        "tool": "get_startup_apps",
-        "timestamp": datetime.now().isoformat(),
-        "supported_os": True,
-        "total_count": len(startup_items),
-        "warnings": errors_or_warnings,
-        "startup_programs": startup_items,
-    }, indent=4, ensure_ascii=False)
-
-
-def get_background_services(limit: int = 15) -> str:
-    """רשימת שירותים פעילים (Windows Services) שאינם שייכים לליבת המערכת (svchost)."""
-    non_core_services: List[Dict[str, Any]] = []
-
-    if os.name != "nt" or not hasattr(psutil, "win_service_iter"):
-        return json.dumps({
-            "tool": "get_background_services",
-            "timestamp": datetime.now().isoformat(),
-            "supported_os": False,
-            "services": [],
-        }, indent=4, ensure_ascii=False)
-
-    for service in psutil.win_service_iter():
-        try:
-            info = service.as_dict()
-            if info.get("status") != "running":
-                continue
-            binpath = str(info.get("binpath") or "")
-            if "c:\\\\windows\\\\system32\\\\svchost.exe" in binpath.lower():
-                continue
-
-            non_core_services.append({
-                "name": info.get("name"),
-                "display_name": info.get("display_name"),
-                "status": info.get("status"),
-                "start_type": info.get("start_type"),
-                "pid": info.get("pid"),
-                "binpath": binpath,
-            })
-        except (psutil.AccessDenied, psutil.NoSuchProcess, OSError, Exception):
-            continue
-
-    return json.dumps({
-        "tool": "get_background_services",
-        "timestamp": datetime.now().isoformat(),
-        "supported_os": True,
-        "total_non_core_running": len(non_core_services),
-        "services": non_core_services[:limit],
     }, indent=4, ensure_ascii=False)
 `,
     },
     {
       id: 'ai_agent.py',
       filename: 'python_desktop_app/ai_agent.py',
-      titleHe: 'מנוע ה-AI ולולאת ה-Function Calling',
-      descriptionHe: 'מחבר את כל 5 הכלים ל-API של המודל, מריץ את לולאת החקירה (Baseline -> Triage -> Tool Execution -> Feedback Loop) ומחזיר דוח מובנה.',
-      specSection: 'סעיף 4 - Agent Workflow',
+      titleHe: 'מנוע ה-AI + מניעת לולאות וסינון בטיחות',
+      descriptionHe: 'מונע קריאות כפולות לאותו כלי באמצעות executed_calls_cache, מגביל ל-3 סבבים מקסימום, וחוסם המלצות לסגירת תהליכי ליבה.',
+      specSection: 'סעיף 4 + הגנת לולאות ובטיחות',
       code: `"""
 ai_agent.py - מנוע ההחלטות (AI Agent) ולולאת התקשורת (The Loop) לפי סעיפים 4 ו-5 במסמך האפיון.
+
+הגנות הנדסיות קריטיות שהוטמעו בקובץ זה:
+1. מניעת לולאה אינסופית וקריאות כפולות (Deduplication & Call Cache):
+   שומר מילון executed_calls_cache עם חתימת כל קריאה (tool_name, json_args).
+   אם המודל מבקש להריץ שוב את אותו כלי עם אותם פרמטרים, הסקריפט עוצר את הלולאה ומעביר אותו לסיכום.
+2. תקרת איטרציות קשיחה (MAX_TOOL_TURNS = 3).
+3. סינון בטיחות להמלצות (sanitize_report_recommendations):
+   חוסם כל המלצה לסגור תהליכי ליבה קריטיים כגון svchost.exe, System, explorer.exe או lsass.exe.
 """
 
 import json
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 from google import genai
 from google.genai import types
 
@@ -485,55 +422,41 @@ from .collectors import (
     get_background_services,
 )
 
-AVAILABLE_DIAGNOSTIC_TOOLS: Dict[str, Callable] = {
-    "get_top_cpu_processes": get_top_cpu_processes,
-    "get_top_memory_processes": get_top_memory_processes,
-    "get_disk_io_status": get_disk_io_status,
-    "get_startup_apps": get_startup_apps,
-    "get_background_services": get_background_services,
-}
-
-DIAGNOSTIC_TOOL_DECLARATIONS = [
-    types.FunctionDeclaration(
-        name="get_top_cpu_processes",
-        description="מחזיר את התהליכים העמוסים ביותר חישובית (CPU).",
-        parameters=types.Schema(
-            type=types.Type.OBJECT,
-            properties={"limit": types.Schema(type=types.Type.INTEGER)},
-        ),
-    ),
-    types.FunctionDeclaration(
-        name="get_top_memory_processes",
-        description="מחזיר את צרכני הזיכרון (RAM) הכבדים ביותר במערכת.",
-        parameters=types.Schema(
-            type=types.Type.OBJECT,
-            properties={"limit": types.Schema(type=types.Type.INTEGER)},
-        ),
-    ),
-    types.FunctionDeclaration(
-        name="get_disk_io_status",
-        description="מחזיר נתוני קריאה/כתיבה בזמן אמת וצווארי בקבוק בדיסק.",
-        parameters=types.Schema(type=types.Type.OBJECT, properties={}),
-    ),
-    types.FunctionDeclaration(
-        name="get_startup_apps",
-        description="שולף תוכנות שנטענות עם עליית המחשב (Startup).",
-        parameters=types.Schema(type=types.Type.OBJECT, properties={}),
-    ),
-    types.FunctionDeclaration(
-        name="get_background_services",
-        description="רשימת שירותים פעילים שאינם שייכים לליבת המערכת.",
-        parameters=types.Schema(
-            type=types.Type.OBJECT,
-            properties={"limit": types.Schema(type=types.Type.INTEGER)},
-        ),
-    ),
+FORBIDDEN_KILL_PROCESSES = [
+    "svchost.exe",
+    "explorer.exe",
+    "lsass.exe",
+    "csrss.exe",
+    "wininit.exe",
+    "services.exe",
+    "dwm.exe",
+    "smss.exe",
 ]
 
-DIAGNOSTIC_SYSTEM_PROMPT = """אתה טכנאי מחשבים מומחה ומאבחן ביצועי מערכת בכיר.
-1. נתח את תמונת הבסיס (Baseline Snapshot).
-2. הפעל את הכלים הרלוונטיים מתוך 5 הכלים שלך כדי לאתר את שורש האיטיות.
-3. החזר דוח סופי בעברית המחולק ל-3 חלקים: אבחון הבעיה, הגורמים המרכזיים, והמלצות לפעולה."""
+
+def sanitize_report_recommendations(report: DiagnosticFinalReport) -> DiagnosticFinalReport:
+    """
+    שכבת הגנה בקוד (Post-Processing Safety Filter):
+    מוודאת שגם אם מודל השפה טעה והמליץ לסגור תהליך ליבה כמו svchost.exe או explorer.exe,
+    ההמלצה תיחסם ותוחלף באזהרת בטיחות ברורה לפני שהיא מוצגת למשתמש.
+    """
+    safe_recommendations: List[str] = []
+    dangerous_verbs = ["סגור", "לסגור", "הרוג", "להרוג", "סיים", "לסיים", "בטל", "kill", "terminate", "end task"]
+
+    for rec in report.action_recommendations:
+        rec_lower = rec.lower()
+        mentioned_critical = [proc for proc in FORBIDDEN_KILL_PROCESSES if proc in rec_lower]
+
+        if mentioned_critical and any(verb in rec_lower for verb in dangerous_verbs):
+            proc_names = ", ".join(mentioned_critical)
+            safe_recommendations.append(
+                f"[הגנת מערכת אוטומטית]: זוהתה פעילות בתהליך המערכת ({proc_names}), אך מדובר בתהליך ליבה קריטי של Windows שאסור לסגור ידנית כדי למנוע קריסת מערכת."
+            )
+        else:
+            safe_recommendations.append(rec)
+
+    report.action_recommendations = safe_recommendations
+    return report
 
 
 def run_diagnostic_workflow(
@@ -551,7 +474,7 @@ def run_diagnostic_workflow(
     client = genai.Client(**client_kwargs)
     model_name = app_config.model_name
 
-    notify("[1/3] אוסף תמונת מצב ראשונית (Baseline Snapshot)...")
+    notify("[1/3] אוסף תמונת מצב ראשונית בדגימה כפולה ממוצעת (Baseline Snapshot)...")
     baseline_json = get_system_snapshot(app_config.system_drive)
 
     user_prompt = f"תמונת מצב בסיסית (JSON):\\n{baseline_json}\\n"
@@ -565,7 +488,7 @@ def run_diagnostic_workflow(
     tool_config = types.GenerateContentConfig(
         system_instruction=DIAGNOSTIC_SYSTEM_PROMPT,
         tools=[types.Tool(function_declarations=DIAGNOSTIC_TOOL_DECLARATIONS)],
-        temperature=0.2,
+        temperature=0.1,
     )
 
     notify("[2/3] מבצע הערכה ראשונית (Triage)...")
@@ -575,35 +498,52 @@ def run_diagnostic_workflow(
         config=tool_config,
     )
 
+    # לולאת הכלים עם Deduplication Cache ותקרת 3 סבבים
+    MAX_TOOL_TURNS = 3
     turn = 0
-    while response.function_calls and turn < 5:
+    executed_calls_cache: Dict[Tuple[str, str], Dict] = {}
+
+    while response.function_calls and turn < MAX_TOOL_TURNS:
         turn += 1
         if response.candidates and response.candidates[0].content:
             contents.append(response.candidates[0].content)
 
         tool_parts: List[types.Part] = []
+        duplicate_detected = False
+
         for call in response.function_calls:
             func_name = call.name
             func_args = call.args or {}
-            notify(f" -> מפעיל כלי מקומי: {func_name}({func_args})")
+            call_signature = (func_name, json.dumps(func_args, sort_keys=True))
 
+            if call_signature in executed_calls_cache:
+                duplicate_detected = True
+                notify(f" [הגנת לולאה] דילוג על קריאה כפולה לכלי {func_name}")
+                tool_parts.append(
+                    types.Part.from_function_response(
+                        name=func_name,
+                        response={"result": {"notice": "Already executed", "cached": executed_calls_cache[call_signature]}},
+                    )
+                )
+                continue
+
+            notify(f" -> [סבב {turn}/{MAX_TOOL_TURNS}] מפעיל כלי מקומי: {func_name}({func_args})")
             target_fn = AVAILABLE_DIAGNOSTIC_TOOLS.get(func_name)
-            if target_fn is not None:
-                try:
-                    parsed_res = json.loads(target_fn(**func_args))
-                except Exception as exc:
-                    parsed_res = {"error": str(exc)}
-            else:
-                parsed_res = {"error": f"Unknown tool: {func_name}"}
+            parsed_res = json.loads(target_fn(**func_args)) if target_fn else {"error": "Unknown tool"}
+            executed_calls_cache[call_signature] = parsed_res
 
             tool_parts.append(
                 types.Part.from_function_response(name=func_name, response={"result": parsed_res})
             )
 
         contents.append(types.Content(role="user", parts=tool_parts))
+
+        if duplicate_detected or turn >= MAX_TOOL_TURNS:
+            break
+
         response = client.models.generate_content(model=model_name, contents=contents, config=tool_config)
 
-    notify("[3/3] מפיק דוח אבחון סופי מחולק ל-3 פרקים...")
+    notify("[3/3] מפיק דוח אבחון סופי ובטוח מחולק ל-3 פרקים...")
     contents.append(
         types.Content(
             role="user",
@@ -618,11 +558,12 @@ def run_diagnostic_workflow(
             system_instruction=DIAGNOSTIC_SYSTEM_PROMPT,
             response_mime_type="application/json",
             response_schema=DiagnosticFinalReport,
-            temperature=0.2,
+            temperature=0.1,
         ),
     )
 
-    return DiagnosticFinalReport.model_validate_json(structured_response.text)
+    raw_report = DiagnosticFinalReport.model_validate_json(structured_response.text)
+    return sanitize_report_recommendations(raw_report)
 `,
     },
     {

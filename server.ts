@@ -21,17 +21,25 @@ const ai = new GoogleGenAI({
   },
 });
 
+const FORBIDDEN_KILL_PROCESSES = [
+  'svchost.exe',
+  'explorer.exe',
+  'lsass.exe',
+  'csrss.exe',
+  'wininit.exe',
+  'services.exe',
+  'dwm.exe',
+  'smss.exe',
+];
+
 const DIAGNOSTIC_SYSTEM_PROMPT = `אתה טכנאי מחשבים מומחה ומאבחן ביצועי מערכת בכיר (AI System Diagnostics Agent).
 תפקידך לקבל את 'תמונת המצב הכללית' (System Snapshot) של המחשב בפורמט JSON ולנתח את בריאות המערכת.
 
-הנחיות עבודה לפי מסמך האפיון:
-1. בחן תחילה את תמונת המצב הכללית (אחוז שימוש ב-CPU, אחוז ניצול זיכרון RAM, ושטח פנוי בכונן המערכת).
-2. בצע Triage והפעל את כלי החקירה הרלוונטיים מתוך 5 הכלים העומדים לרשותך:
-   - get_top_cpu_processes לבדיקת התהליכים העמוסים ביותר חישובית.
-   - get_top_memory_processes לבדיקת צרכני הזיכרון (RAM) הכבדים ביותר.
-   - get_disk_io_status לבדיקת נתוני קריאה/כתיבה וצווארי בקבוק בדיסק.
-   - get_startup_apps לבדיקת תוכנות שנטענות אוטומטית עם עליית המחשב.
-   - get_background_services לבדיקת שירותי רקע פעילים שאינם שייכים לליבת המערכת.
+כללי ברזל לבטיחות ומניעת לולאות:
+1. איסור מוחלט על קריאות חוזרות: אל תקרא לאותו כלי (Tool) יותר מפעם אחת באותו אבחון!
+2. הגנת תהליכי מערכת קריטיים (Safety Guardrail):
+   לעולם אל תמליץ למשתמש לסגור, להרוג (Kill) או להשבית תהליכי מערכת קריטיים של Windows כגון:
+   svchost.exe, System, explorer.exe, lsass.exe, csrss.exe, wininit.exe, dwm.exe, services.exe, MsMpEng.exe.
 3. לאחר שקיבלת את תוצאות הכלים, ספק למשתמש דוח אבחון ברור, מקצועי ומסודר בעברית המחולק ל-3 חלקים ברורים:
    - אבחון הבעיה (problem_diagnosis)
    - הגורמים המרכזיים (main_causes)
@@ -40,7 +48,7 @@ const DIAGNOSTIC_SYSTEM_PROMPT = `אתה טכנאי מחשבים מומחה ומ
 const diagnosticToolDeclarations: FunctionDeclaration[] = [
   {
     name: 'get_top_cpu_processes',
-    description: 'מחזיר את התהליכים העמוסים ביותר חישובית (CPU).',
+    description: 'מחזיר את תהליכי המשתמש העמוסים ביותר חישובית (CPU). יש לקרוא לכלי זה לכל היותר פעם אחת.',
     parameters: {
       type: Type.OBJECT,
       properties: {
@@ -53,7 +61,7 @@ const diagnosticToolDeclarations: FunctionDeclaration[] = [
   },
   {
     name: 'get_top_memory_processes',
-    description: 'מחזיר את צרכני הזיכרון (RAM) הכבדים ביותר במערכת.',
+    description: 'מחזיר את צרכני הזיכרון (RAM) הכבדים ביותר במערכת. יש לקרוא לכלי זה לכל היותר פעם אחת.',
     parameters: {
       type: Type.OBJECT,
       properties: {
@@ -144,6 +152,19 @@ interface ToolTraceStep {
   toolName: string;
   args: Record<string, unknown>;
   resultPreview: unknown;
+  deduplicated?: boolean;
+}
+
+function sanitizeRecommendations(recommendations: string[]): string[] {
+  const dangerousVerbs = ['סגור', 'לסגור', 'הרוג', 'להרוג', 'סיים', 'לסיים', 'בטל', 'kill', 'terminate', 'end task'];
+  return recommendations.map((rec) => {
+    const lower = rec.toLowerCase();
+    const matchedCritical = FORBIDDEN_KILL_PROCESSES.filter((proc) => lower.includes(proc));
+    if (matchedCritical.length > 0 && dangerousVerbs.some((v) => lower.includes(v))) {
+      return `[הגנת מערכת אוטומטית]: זוהתה פעילות בתהליך המערכת (${matchedCritical.join(', ')}), אך מדובר בתהליך ליבה קריטי של Windows שאסור לסגור ידנית כדי למנוע קריסת מערכת. מומלץ לבדוק עדכוני Windows או לבצע הפעלה מחדש מסודרת.`;
+    }
+    return rec;
+  });
 }
 
 app.post('/api/diagnose', async (req, res) => {
@@ -163,7 +184,7 @@ app.post('/api/diagnose', async (req, res) => {
       `${JSON.stringify(snapshot, null, 2)}\n\n` +
       (userIssue
         ? `תלונת המשתמש / מיקוד הבדיקה: ${userIssue}\n`
-        : `אנא נתח את תמונת המצב והפעל את הכלים המתאימים מתוך 5 הכלים שלך.`);
+        : `אנא נתח את תמונת המצב והפעל את הכלים המתאימים מתוך 5 הכלים שלך (פעם אחת בלבד לכל כלי).`);
 
     const contents: Content[] = [
       {
@@ -173,6 +194,7 @@ app.post('/api/diagnose', async (req, res) => {
     ];
 
     const toolTrace: ToolTraceStep[] = [];
+    const executedCallsCache = new Map<string, unknown>();
     const modelName = 'gemini-3.8-flash';
 
     let response = await ai.models.generateContent({
@@ -181,12 +203,12 @@ app.post('/api/diagnose', async (req, res) => {
       config: {
         systemInstruction: DIAGNOSTIC_SYSTEM_PROMPT,
         tools: [{ functionDeclarations: diagnosticToolDeclarations }],
-        temperature: 0.2,
+        temperature: 0.1,
       },
     });
 
     let turnCount = 0;
-    const maxToolTurns = 5;
+    const maxToolTurns = 3;
 
     while (response.functionCalls && response.functionCalls.length > 0 && turnCount < maxToolTurns) {
       turnCount += 1;
@@ -196,10 +218,37 @@ app.post('/api/diagnose', async (req, res) => {
       }
 
       const functionResponseParts: Part[] = [];
+      let duplicateDetectedInTurn = false;
 
       for (const call of response.functionCalls) {
         const funcName = call.name || 'unknown';
         const funcArgs = (call.args as Record<string, unknown>) || {};
+        const signature = `${funcName}:${JSON.stringify(funcArgs)}`;
+
+        if (executedCallsCache.has(signature)) {
+          duplicateDetectedInTurn = true;
+          const cachedOutput = executedCallsCache.get(signature);
+          toolTrace.push({
+            step: turnCount,
+            toolName: funcName,
+            args: funcArgs,
+            resultPreview: { notice: 'נשלף מהמטמון (מניעת קריאה כפולה)' },
+            deduplicated: true,
+          });
+          functionResponseParts.push({
+            functionResponse: {
+              name: funcName,
+              response: {
+                result: {
+                  notice: `Tool '${funcName}' was ALREADY executed. Do NOT call it again.`,
+                  cached_data: cachedOutput,
+                },
+              },
+            },
+          });
+          continue;
+        }
+
         let toolOutput: unknown = {};
 
         if (funcName === 'get_top_cpu_processes') {
@@ -228,11 +277,14 @@ app.post('/api/diagnose', async (req, res) => {
           toolOutput = { error: `Unknown tool: ${funcName}` };
         }
 
+        executedCallsCache.set(signature, toolOutput);
+
         toolTrace.push({
           step: turnCount,
           toolName: funcName,
           args: funcArgs,
           resultPreview: toolOutput,
+          deduplicated: false,
         });
 
         functionResponseParts.push({
@@ -248,13 +300,17 @@ app.post('/api/diagnose', async (req, res) => {
         parts: functionResponseParts,
       });
 
+      if (duplicateDetectedInTurn || turnCount >= maxToolTurns) {
+        break;
+      }
+
       response = await ai.models.generateContent({
         model: modelName,
         contents,
         config: {
           systemInstruction: DIAGNOSTIC_SYSTEM_PROMPT,
           tools: [{ functionDeclarations: diagnosticToolDeclarations }],
-          temperature: 0.2,
+          temperature: 0.1,
         },
       });
     }
@@ -263,7 +319,7 @@ app.post('/api/diagnose', async (req, res) => {
       role: 'user',
       parts: [
         {
-          text: 'כעת הפק את דוח האבחון הסופי בפורמט המובנה המחולק ל-3 חלקים: אבחון הבעיה, הגורמים המרכזיים, והמלצות לפעולה.',
+          text: 'כעת הפק את דוח האבחון הסופי בפורמט המובנה המחולק ל-3 חלקים: אבחון הבעיה, הגורמים המרכזיים, והמלצות לפעולה. זכור שאסור להמליץ על סגירת תהליכי מערכת קריטיים.',
         },
       ],
     });
@@ -275,13 +331,17 @@ app.post('/api/diagnose', async (req, res) => {
         systemInstruction: DIAGNOSTIC_SYSTEM_PROMPT,
         responseMimeType: 'application/json',
         responseSchema: finalReportResponseSchema,
-        temperature: 0.2,
+        temperature: 0.1,
       },
     });
 
     let structuredReport = null;
     try {
-      structuredReport = JSON.parse(structuredResponse.text || '{}');
+      const parsed = JSON.parse(structuredResponse.text || '{}');
+      if (Array.isArray(parsed.action_recommendations)) {
+        parsed.action_recommendations = sanitizeRecommendations(parsed.action_recommendations);
+      }
+      structuredReport = parsed;
     } catch {
       structuredReport = null;
     }
