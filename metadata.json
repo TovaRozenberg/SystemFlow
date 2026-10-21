@@ -1,0 +1,6 @@
+{
+  "name": "כלי דיאגנוסטיקה למערכת (psutil)",
+  "description": "כלי דיאגנוסטיקה למחשב בפייתון האוסף תמונת מצב כללית של המערכת (מעבד, זיכרון RAM ואחסון) ומייצא ל-JSON מסודר.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
