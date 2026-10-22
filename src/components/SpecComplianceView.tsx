@@ -96,10 +96,10 @@ export const SpecComplianceView: React.FC = () => {
           <FileCheck className="w-5 h-5 text-emerald-400" />
           <div>
             <h2 className="text-base font-bold text-white">
-              בדיקת התאמה מלאה למסמך האפיון והארכיטקטורה (MD Compliance Audit)
+              מיפוי דרישות ומימושים בחבילת Python
             </h2>
             <p className="text-xs text-slate-400">
-              כל סעיפי מסמך האפיון שלך ממומשים ב-100% בתוך הקוד המודולרי בתיקיית <code className="text-sky-300 font-mono">python_desktop_app/</code>.
+              סקירה תיאורית של רכיבים מרכזיים בחבילת <code className="text-sky-300 font-mono">python_desktop_app/</code>; אין לראות בה תחליף להרצת בדיקות על סביבת היעד.
             </p>
           </div>
         </div>

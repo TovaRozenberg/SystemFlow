@@ -3,12 +3,14 @@ desktop_gui.py - ממשק גרפי לדסקטופ באמצעות Tkinter (סעי
 כולל חלון הגדרות מובנה (כונן מערכת, בחירת מודל, כמות תהליכים והגדרות חיבור) ותצוגת 3 חלקי האבחון.
 """
 
+import queue
 import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
 
 from .config import AppConfig
 from .ai_agent import run_diagnostic_workflow
+from .models import DiagnosticFinalReport
 
 
 class DiagnosticsDesktopApp:
@@ -21,7 +23,9 @@ class DiagnosticsDesktopApp:
         self.root = root
         self.root.title("AI System Diagnostics - כלי אבחון איטיות במחשב")
         self.root.geometry("980x720")
+        self.root.minsize(760, 560)
         self.config = AppConfig()
+        self.worker_events: queue.Queue[tuple[str, object]] = queue.Queue()
 
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
@@ -34,6 +38,7 @@ class DiagnosticsDesktopApp:
 
         self._build_diagnostics_tab()
         self._build_settings_tab()
+        self.root.after(100, self._poll_worker_events)
 
     def _build_diagnostics_tab(self) -> None:
         top_frame = ttk.Frame(self.tab_diagnostics)
@@ -58,16 +63,22 @@ class DiagnosticsDesktopApp:
         self.status_label.pack(side=tk.RIGHT, padx=12)
 
         # 3 תיבות תצוגה עבור 3 חלקי הדוח
+        output_frame = ttk.Frame(self.tab_diagnostics)
+        output_frame.pack(fill=tk.BOTH, expand=True)
         self.output_text = tk.Text(
-            self.tab_diagnostics,
+            output_frame,
             wrap=tk.WORD,
             font=("Consolas", 11),
             bg="#0f172a",
             fg="#f8fafc",
             padx=14,
             pady=14,
+            state=tk.DISABLED,
         )
-        self.output_text.pack(fill=tk.BOTH, expand=True)
+        output_scrollbar = ttk.Scrollbar(output_frame, orient=tk.VERTICAL, command=self.output_text.yview)
+        self.output_text.configure(yscrollcommand=output_scrollbar.set)
+        self.output_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        output_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
     def _build_settings_tab(self) -> None:
         ttk.Label(
@@ -108,35 +119,70 @@ class DiagnosticsDesktopApp:
         save_btn.pack(anchor=tk.E, pady=16)
 
     def _save_settings(self) -> None:
-        self.config.save({
-            "api_key": self.api_key_var.get().strip(),
-            "model_name": self.model_var.get().strip(),
-            "system_drive": self.drive_var.get().strip(),
-            "default_process_limit": int(self.limit_var.get()),
-        })
+        try:
+            process_limit = int(self.limit_var.get())
+            if not 3 <= process_limit <= 15:
+                raise ValueError("מספר התהליכים חייב להיות בין 3 ל-15.")
+            if not self.model_var.get().strip() or not self.drive_var.get().strip():
+                raise ValueError("יש למלא שם מודל ונתיב כונן.")
+            self.config.save({
+                "api_key": self.api_key_var.get().strip(),
+                "model_name": self.model_var.get().strip(),
+                "system_drive": self.drive_var.get().strip(),
+                "default_process_limit": process_limit,
+            })
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("שמירת הגדרות נכשלה", str(exc))
+            return
         messagebox.showinfo("נשמר", "ההגדרות נשמרו בהצלחה לקובץ התצורה המקומי.")
 
     def _start_diagnosis_thread(self) -> None:
-        self.run_btn.config(state=tk.DISABLED)
-        self.output_text.delete("1.0", tk.END)
         issue = self.issue_entry.get().strip()
+        if not issue:
+            messagebox.showwarning("תיאור חסר", "יש לתאר את הבעיה לפני הפעלת האבחון.")
+            return
+
+        self.run_btn.config(state=tk.DISABLED)
+        self.status_label.config(text="האבחון מתחיל...")
+        self.output_text.config(state=tk.NORMAL)
+        self.output_text.delete("1.0", tk.END)
+        self.output_text.config(state=tk.DISABLED)
 
         def worker() -> None:
             try:
                 report = run_diagnostic_workflow(
                     config=self.config,
                     user_issue_description=issue,
-                    on_status_update=lambda msg: self.root.after(0, lambda: self.status_label.config(text=msg)),
+                    on_status_update=lambda msg: self.worker_events.put(("status", msg)),
                 )
-                self.root.after(0, lambda: self._render_report(report))
+                self.worker_events.put(("report", report))
             except Exception as exc:
-                self.root.after(0, lambda: messagebox.showerror("שגיאה", str(exc)))
+                self.worker_events.put(("error", str(exc)))
             finally:
-                self.root.after(0, lambda: self.run_btn.config(state=tk.NORMAL))
+                self.worker_events.put(("done", None))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _render_report(self, report) -> None:
+    def _poll_worker_events(self) -> None:
+        while True:
+            try:
+                event, payload = self.worker_events.get_nowait()
+            except queue.Empty:
+                break
+
+            if event == "status":
+                self.status_label.config(text=str(payload))
+            elif event == "report":
+                self._render_report(payload)
+            elif event == "error":
+                self.status_label.config(text="האבחון נכשל.")
+                messagebox.showerror("שגיאה באבחון", str(payload))
+            elif event == "done":
+                self.run_btn.config(state=tk.NORMAL)
+
+        self.root.after(100, self._poll_worker_events)
+
+    def _render_report(self, report: DiagnosticFinalReport) -> None:
         self.status_label.config(text=f"האבחון הושלם (חומרה: {report.severity})")
         lines = [
             f"=== 1. אבחון הבעיה (רמת חומרה: {report.severity}) ===",
@@ -152,7 +198,9 @@ class DiagnosticsDesktopApp:
         for idx, rec in enumerate(report.action_recommendations, start=1):
             lines.append(f"{idx}. {rec}")
 
+        self.output_text.config(state=tk.NORMAL)
         self.output_text.insert(tk.END, "\n".join(lines))
+        self.output_text.config(state=tk.DISABLED)
 
 
 def launch_desktop_gui() -> None:

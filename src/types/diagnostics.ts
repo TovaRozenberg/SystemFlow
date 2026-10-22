@@ -124,6 +124,7 @@ export interface ToolTraceStep {
   toolName: string;
   args: Record<string, unknown>;
   resultPreview: unknown;
+  deduplicated?: boolean;
 }
 
 export interface RootCauseItem {

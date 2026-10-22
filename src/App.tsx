@@ -3,8 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useCallback } from 'react';
-import { Download, RefreshCw, Sliders } from 'lucide-react';
+import React, { useState } from 'react';
+import { Download, Sliders } from 'lucide-react';
 import {
   DesktopTabId,
   SystemSnapshot,
@@ -27,7 +27,6 @@ export default function App() {
   const [drivePath, setDrivePath] = useState<string>('C:\\');
   const [intervalSec] = useState<number>(1.0);
   const [processLimit, setProcessLimit] = useState<number>(5);
-  const [isSampling, setIsSampling] = useState<boolean>(false);
 
   const [userIssue, setUserIssue] = useState<string>(
     'המחשב מרגיש איטי בזמן עבודה, הדיסק עובד קשה וגם לוקח לו הרבה זמן לעלות בהדלקה. תבדוק אילו תהליכים, שירותים או תוכנות אתחול גורמים לזה.'
@@ -35,38 +34,7 @@ export default function App() {
   const [isRunningAi, setIsRunningAi] = useState<boolean>(false);
   const [aiError, setAiError] = useState<string>('');
 
-  const [aiToolTrace, setAiToolTrace] = useState<ToolTraceStep[]>([
-    {
-      step: 1,
-      toolName: 'get_top_cpu_processes',
-      args: { limit: 5 },
-      resultPreview: { top_process: 'python.exe (38.45% CPU)' },
-    },
-    {
-      step: 1,
-      toolName: 'get_top_memory_processes',
-      args: { limit: 5 },
-      resultPreview: { top_process: 'chrome.exe (8420.65 MB)' },
-    },
-    {
-      step: 1,
-      toolName: 'get_disk_io_status',
-      args: {},
-      resultPreview: { write_mb_per_sec: 148.5, bottleneck_suspected: true },
-    },
-    {
-      step: 1,
-      toolName: 'get_startup_apps',
-      args: {},
-      resultPreview: { total_count: 6 },
-    },
-    {
-      step: 1,
-      toolName: 'get_background_services',
-      args: { limit: 15 },
-      resultPreview: { total_non_core_running: 5 },
-    },
-  ]);
+  const [aiToolTrace, setAiToolTrace] = useState<ToolTraceStep[]>([]);
 
   const [structuredReport, setStructuredReport] = useState<StructuredDiagnosticReport>({
     severity: 'עומס גבוה / קריטי',
@@ -250,9 +218,15 @@ export default function App() {
 
   const pythonModules = getPythonProjectModules(drivePath, intervalSec, processLimit);
 
-  const runLiveAiAgent = async () => {
+  const runAiAnalysis = async () => {
+    if (!userIssue.trim()) {
+      setAiError('יש לתאר את הבעיה לפני הפעלת הניתוח.');
+      return;
+    }
+
     setIsRunningAi(true);
     setAiError('');
+    setAiToolTrace([]);
     try {
       const response = await fetch('/api/diagnose', {
         method: 'POST',
@@ -282,40 +256,6 @@ export default function App() {
     }
   };
 
-  const runLiveSample = useCallback(() => {
-    setIsSampling(true);
-    setTimeout(() => {
-      const nowIso = new Date().toISOString();
-      const cpuUsage = Number((40 + Math.random() * 48).toFixed(1));
-      const totalRam = 31.88;
-      const availableRam = Number((3.5 + Math.random() * 7).toFixed(2));
-      const usedRam = Number((totalRam - availableRam).toFixed(2));
-      const ramPercent = Number(((usedRam / totalRam) * 100).toFixed(1));
-
-      setSnapshot((prev) => ({
-        ...prev,
-        timestamp: nowIso,
-        cpu: { ...prev.cpu, usage_percent: cpuUsage },
-        memory_ram: {
-          total_gb: totalRam,
-          available_gb: availableRam,
-          used_gb: usedRam,
-          used_percent: ramPercent,
-        },
-      }));
-
-      setTopCpuReport((prev) => ({
-        ...prev,
-        timestamp: nowIso,
-      }));
-      setTopMemoryReport((prev) => ({
-        ...prev,
-        timestamp: nowIso,
-      }));
-      setIsSampling(false);
-    }, 300);
-  }, []);
-
   const handleDownloadFullBundle = () => {
     const bundleContent = pythonModules
       .map(
@@ -327,29 +267,59 @@ export default function App() {
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = 'python_desktop_app_bundle.py';
+    link.download = 'python_desktop_app_bundle.txt';
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
-    URL.revokeObjectURL(url);
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
+  };
+
+  const handleDownloadReport = () => {
+    const reportContent = JSON.stringify(
+      {
+        generatedAt: new Date().toISOString(),
+        dataSource: 'static-demo-data',
+        userIssue,
+        diagnostics: {
+          snapshot,
+          topCpuReport,
+          topMemoryReport,
+          diskIoReport,
+          startupReport,
+          backgroundServicesReport,
+        },
+        structuredReport,
+        toolTrace: aiToolTrace,
+      },
+      null,
+      2,
+    );
+    const url = URL.createObjectURL(new Blob([reportContent], { type: 'application/json;charset=utf-8' }));
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'system-diagnostics-demo-report.json';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
   };
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col">
       {/* Top Bar Contract: 3 zones separated by gap-8 */}
-      <header className="flex items-center justify-between gap-8 px-6 py-4 border-b border-slate-800 bg-slate-950">
+      <header className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3 px-4 sm:px-6 py-4 border-b border-slate-800 bg-slate-950">
         <a
           href="#top"
           onClick={(e) => {
             e.preventDefault();
             setActiveTab('agent');
           }}
-          className="text-lg font-bold tracking-tight text-white whitespace-nowrap shrink-0"
+          className="text-base sm:text-lg font-bold tracking-tight text-white whitespace-nowrap shrink-0"
         >
           כלי דיאגנוסטיקה למערכת · Desktop Suite
         </a>
 
-        <nav className="hidden md:flex items-center gap-6 text-sm font-medium text-slate-400">
+        <nav aria-label="ניווט ראשי" className="order-3 flex basis-full min-w-0 items-center gap-4 overflow-x-auto text-xs sm:text-sm font-medium text-slate-400 md:order-none md:basis-auto">
           <button
             onClick={() => setActiveTab('agent')}
             className={`hover:text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
@@ -387,16 +357,27 @@ export default function App() {
         <div className="flex items-center gap-3 shrink-0">
           <button
             onClick={handleDownloadFullBundle}
-            className="flex items-center gap-2 px-4 py-2 text-xs font-semibold text-slate-950 bg-sky-400 rounded-lg hover:bg-sky-300 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            className="flex items-center gap-2 px-3 sm:px-4 py-2 text-xs font-semibold text-slate-950 bg-sky-400 rounded-lg hover:bg-sky-300 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
           >
             <Download className="w-4 h-4" />
-            <span>הורד חבילת דסקטופ מלאה</span>
+            <span className="hidden sm:inline">הורד קוד מקור מאוגד</span>
+          </button>
+          <button
+            onClick={handleDownloadReport}
+            className="flex items-center gap-2 px-3 sm:px-4 py-2 text-xs font-semibold text-slate-100 bg-slate-800 rounded-lg hover:bg-slate-700 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+          >
+            <Download className="w-4 h-4" />
+            <span className="hidden sm:inline">ייצא דוח</span>
           </button>
         </div>
       </header>
 
       {/* Main Content Container */}
-      <main className="flex-1 max-w-[1360px] w-full mx-auto px-6 py-8 space-y-8">
+      <main className="flex-1 max-w-[1360px] w-full mx-auto px-4 sm:px-6 py-6 sm:py-8 space-y-6 sm:space-y-8">
+        <aside className="rounded-lg border border-amber-700/60 bg-amber-950/30 px-4 py-3 text-sm text-amber-100" role="note">
+          <strong className="font-semibold">מצב הדגמה:</strong>{' '}
+          המדדים והדוחות במסך הם נתונים לדוגמה, לא נאספו מהמחשב הזה. ניתוח ה-AI מתייחס לדוגמאות בלבד; ניטור מקומי אמיתי עדיין אינו מחובר לממשק.
+        </aside>
         {/* Top Workspace Header & Parameters */}
         <section className="flex flex-col lg:flex-row lg:items-end justify-between gap-6 pb-6 border-b border-slate-800">
           <div className="space-y-2 max-w-2xl">
@@ -408,17 +389,17 @@ export default function App() {
               <span>Rich CLI + Tkinter GUI</span>
             </div>
             <h1 className="text-2xl sm:text-3xl font-bold text-white tracking-tight">
-              כלי אבחון איטיות במחשב מבוסס AI · מימוש מלא של מסמך האפיון
+              כלי אבחון מערכת · ממשק הדגמה וחבילת Python
             </h1>
             <p className="text-sm text-slate-400 leading-relaxed">
-              הקוד פוצל לארכיטקטורה מודולרית ונקייה של 7 קבצים בתיקיית <code className="text-sky-300 font-mono">python_desktop_app/</code>, ומממש 100% מדרישות מסמך ה-MD שלך — כולל כל 5 כלי ה-AI, לולאת ה-Agent, עיצוב קונסול ב-3 פרקים וממשק דסקטופ עם לשונית הגדרות.
+              הפרויקט כולל ממשק הדגמה ב-React וחבילת Python נפרדת לאבחון מקומי. ממשק ה-Web משתמש כעת בנתונים סטטיים ואינו מחובר עדיין לאיסוף מקומי.
             </p>
           </div>
 
           <div className="flex flex-wrap items-center gap-4 bg-slate-900/70 p-4 rounded-xl border border-slate-800">
             <div className="flex items-center gap-2 text-xs text-slate-300">
               <Sliders className="w-4 h-4 text-slate-400" />
-              <span className="font-medium">הגדרות דגימה:</span>
+              <span className="font-medium">הגדרות לפרויקט Python:</span>
             </div>
 
             <label className="flex items-center gap-2 text-xs text-slate-300">
@@ -447,14 +428,7 @@ export default function App() {
               </select>
             </label>
 
-            <button
-              onClick={runLiveSample}
-              disabled={isSampling}
-              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-100 rounded-md border border-slate-700 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
-            >
-              <RefreshCw className={`w-3.5 h-3.5 ${isSampling ? 'animate-spin' : ''}`} />
-              <span>דגימה חדשה</span>
-            </button>
+            <span className="text-[11px] text-slate-500">ההגדרות משפיעות על קוד הדוגמה בלבד</span>
           </div>
         </section>
 
@@ -464,7 +438,7 @@ export default function App() {
             <RichConsoleView
               userIssue={userIssue}
               onUserIssueChange={setUserIssue}
-              onRunAgent={runLiveAiAgent}
+              onRunAgent={runAiAnalysis}
               isRunningAi={isRunningAi}
               aiError={aiError}
               aiToolTrace={aiToolTrace}

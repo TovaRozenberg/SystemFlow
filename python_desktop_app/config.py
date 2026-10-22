@@ -4,9 +4,12 @@ config.py - ניהול הגדרות ותצורה עבור אפליקציית ה�
 """
 
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Dict, Any
+
+logger = logging.getLogger(__name__)
 
 CONFIG_FILE_PATH = Path.home() / ".ai_system_diagnostics_config.json"
 
@@ -39,8 +42,10 @@ class AppConfig:
                     saved = json.load(f)
                     if isinstance(saved, dict):
                         self.data.update(saved)
-            except Exception:
-                pass
+                    else:
+                        logger.warning("Ignoring settings file with an invalid top-level value: %s", self.config_path)
+            except (OSError, json.JSONDecodeError) as exc:
+                logger.warning("Could not load settings from %s: %s", self.config_path, exc)
 
         # עדיפות למשתנה סביבה אם לא הוגדר בקובץ המקומי
         env_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("OPENAI_API_KEY")
@@ -51,12 +56,13 @@ class AppConfig:
 
     def save(self, updates: Dict[str, Any]) -> None:
         """שומר עדכוני הגדרות (כגון שינוי מודל, כונן או מפתח) לקובץ ההגדרות המקומי."""
-        self.data.update(updates)
-        try:
-            with open(self.config_path, "w", encoding="utf-8") as f:
-                json.dump(self.data, f, indent=4, ensure_ascii=False)
-        except OSError as exc:
-            print(f"Warning: Could not save settings to {self.config_path}: {exc}")
+        updated_data = {**self.data, **updates}
+        self.config_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = self.config_path.with_name(f"{self.config_path.name}.tmp")
+        with open(temporary_path, "w", encoding="utf-8") as f:
+            json.dump(updated_data, f, indent=4, ensure_ascii=False)
+        temporary_path.replace(self.config_path)
+        self.data = updated_data
 
     @property
     def api_key(self) -> str:
